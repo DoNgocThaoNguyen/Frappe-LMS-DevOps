@@ -1,0 +1,311 @@
+---
+- name: DACN - Guarded remote Cloud release and image-only rollback
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    cloud_deploy_approved: false
+    simulate_failure: false
+    stable: "{{ lookup('ansible.builtin.file', playbook_dir + '/last_known_good_cloud.json') | from_json }}"
+    target: "{{ lookup('ansible.builtin.file', playbook_dir + '/target_release_cloud.json') | from_json }}"
+    docker_dir: /home/ubuntu/DACN/SP2/frappe_docker
+    cloud_dir: /home/ubuntu/DACN/SP2/cloud-local
+    cloud_env: "{{ cloud_dir }}/cloud.env"
+    backup_dir: "{{ cloud_dir }}/backups/pre-cloud-rollback"
+    remote_dir: "{{ cloud_dir }}/automation"
+    app_services:
+      - backend
+      - frontend
+      - websocket
+      - queue-short
+      - queue-long
+      - scheduler
+    compose_base:
+      - docker
+      - compose
+      - -p
+      - dacn-cloud
+      - --env-file
+      - "{{ cloud_env }}"
+      - -f
+      - "{{ docker_dir }}/compose.yaml"
+      - -f
+      - "{{ docker_dir }}/overrides/compose.mariadb.yaml"
+      - -f
+      - "{{ docker_dir }}/overrides/compose.redis.yaml"
+      - -f
+      - "{{ cloud_dir }}/compose.port.yml"
+    validator_base:
+      - python3
+      - "{{ remote_dir }}/validate_cloud.py"
+      - --project
+      - dacn-cloud
+
+  tasks:
+    - name: Require explicit permission for Cloud mutation
+      ansible.builtin.assert:
+        that:
+          - cloud_deploy_approved | bool
+        fail_msg: "Stopped safely. Pass -e cloud_deploy_approved=true only after preflight review."
+
+    - name: Validate release metadata and limit scope
+      ansible.builtin.assert:
+        that:
+          - stable.image is match('^ghcr[.]io/dongocthaonguyen/dacn-frappe-lms:sha-[a-f0-9]{12}$')
+          - target.image is match('^ghcr[.]io/dongocthaonguyen/dacn-frappe-lms:sha-[a-f0-9]{12}$')
+          - stable.digest is match('^sha256:[a-f0-9]{64}$')
+          - target.digest is match('^sha256:[a-f0-9]{64}$')
+          - stable.site == 'lms-cloud.localhost'
+          - target.site == stable.site
+          - stable.url == 'http://127.0.0.1:8200/'
+          - target.url == stable.url
+          - stable.image != target.image
+        fail_msg: "Cloud release metadata invalid, or candidate is identical to stable."
+
+    - name: Check presence of external Cloud backup directory
+      ansible.builtin.stat:
+        path: "{{ backup_dir }}"
+      register: backup_stat
+
+    - name: Require off-volume backup folder
+      ansible.builtin.assert:
+        that:
+          - backup_stat.stat.isdir | default(false)
+
+    - name: Find compressed DB backups
+      ansible.builtin.find:
+        paths: "{{ backup_dir }}"
+        patterns: '*-database.sql.gz'
+        file_type: file
+      register: db_backups
+
+    - name: Verify database backup exists
+      ansible.builtin.assert:
+        that:
+          - db_backups.matched | int > 0
+
+    - name: Test each database backup gzip integrity
+      ansible.builtin.command:
+        argv: [gzip, -t, "{{ item.path }}"]
+      loop: "{{ db_backups.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      changed_when: false
+
+    - name: Confirm Cloud config still points to stable tag
+      ansible.builtin.command:
+        argv: [grep, -Fx, "CUSTOM_TAG={{ stable.image.rsplit(':', 1)[1] }}", "{{ cloud_env }}"]
+      changed_when: false
+
+    - name: Confirm Cloud config uses the expected image repository
+      ansible.builtin.command:
+        argv: [grep, -Fx, 'CUSTOM_IMAGE=ghcr.io/dongocthaonguyen/dacn-frappe-lms', "{{ cloud_env }}"]
+      changed_when: false
+
+    - name: Validate Compose configuration (no secrets printed)
+      ansible.builtin.command:
+        argv: "{{ compose_base + ['config', '--quiet'] }}"
+      args:
+        chdir: "{{ docker_dir }}"
+      changed_when: false
+
+    - name: Confirm stable image exists on EC2
+      ansible.builtin.command:
+        argv: [docker, image, inspect, "{{ stable.image }}"]
+      changed_when: false
+      no_log: true
+
+    - name: Ensure validator files are present on EC2
+      ansible.builtin.file:
+        path: "{{ remote_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0750'
+
+    - name: Copy original Python validator
+      ansible.builtin.copy:
+        src: ../validate_deployment.py
+        dest: "{{ remote_dir }}/validate_deployment.py"
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+
+    - name: Copy Cloud Python validator
+      ansible.builtin.copy:
+        src: validate_cloud.py
+        dest: "{{ remote_dir }}/validate_cloud.py"
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+
+    - name: Read-only precheck of last-known-good Cloud deployment
+      ansible.builtin.command:
+        argv: "{{ validator_base + ['--expected-image', stable.image, '--expected-digest', stable.digest, '--site', stable.site, '--url', stable.url] }}"
+      register: baseline_validation
+      changed_when: false
+
+    - name: Pull approved candidate from GHCR before changing Cloud services
+      block:
+        - name: Require GHCR credential from Jenkins
+          ansible.builtin.assert:
+            that:
+              - lookup('ansible.builtin.env', 'GHCR_READ_USER') | length > 0
+              - lookup('ansible.builtin.env', 'GHCR_READ_TOKEN') | length > 0
+          no_log: true
+
+        - name: Create temporary Docker credential directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: dacn-ghcr-
+          register: ghcr_config
+
+        - name: Log in to GHCR with read-only credential
+          ansible.builtin.command:
+            argv:
+              - docker
+              - login
+              - ghcr.io
+              - --username
+              - "{{ lookup('ansible.builtin.env', 'GHCR_READ_USER') }}"
+              - --password-stdin
+            stdin: "{{ lookup('ansible.builtin.env', 'GHCR_READ_TOKEN') }}"
+          environment:
+            DOCKER_CONFIG: "{{ ghcr_config.path }}"
+          changed_when: false
+          no_log: true
+
+        - name: Pull candidate by approved digest
+          ansible.builtin.command:
+            argv:
+              - docker
+              - pull
+              - "{{ target.image.rsplit(':', 1)[0] }}@{{ target.digest }}"
+          environment:
+            DOCKER_CONFIG: "{{ ghcr_config.path }}"
+
+        - name: Assign approved release tag to pulled image
+          ansible.builtin.command:
+            argv:
+              - docker
+              - image
+              - tag
+              - "{{ target.image.rsplit(':', 1)[0] }}@{{ target.digest }}"
+              - "{{ target.image }}"
+
+        - name: Confirm candidate tag now exists on EC2
+          ansible.builtin.command:
+            argv: [docker, image, inspect, "{{ target.image }}"]
+          changed_when: false
+          no_log: true
+
+      always:
+        - name: Log out from temporary GHCR session
+          ansible.builtin.command:
+            argv: [docker, logout, ghcr.io]
+          environment:
+            DOCKER_CONFIG: "{{ ghcr_config.path }}"
+          when: ghcr_config is defined and ghcr_config.path is defined
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: Remove temporary Docker credential directory
+          ansible.builtin.file:
+            path: "{{ ghcr_config.path }}"
+            state: absent
+          when: ghcr_config is defined and ghcr_config.path is defined
+
+    - name: Deploy candidate and validate, otherwise restore stable image
+      block:
+        - name: Set candidate tag in Cloud config (preserve DB password)
+          ansible.builtin.lineinfile:
+            path: "{{ cloud_env }}"
+            regexp: '^CUSTOM_TAG='
+            line: "CUSTOM_TAG={{ target.image.rsplit(':', 1)[1] }}"
+            create: false
+            mode: '0600'
+          no_log: true
+
+        - name: Recreate configurator using candidate image
+          ansible.builtin.command:
+            argv: "{{ compose_base + ['up', '-d', '--no-deps', '--pull', 'never', 'configurator'] }}"
+          args:
+            chdir: "{{ docker_dir }}"
+
+        - name: Ensure candidate configurator completed cleanly
+          ansible.builtin.command:
+            argv: [docker, wait, dacn-cloud-configurator-1]
+          register: candidate_config
+          changed_when: false
+          failed_when: candidate_config.stdout | trim != '0'
+
+        - name: Recreate ONLY the six application services
+          ansible.builtin.command:
+            argv: "{{ compose_base + ['up', '-d', '--no-deps', '--pull', 'never'] + app_services }}"
+          args:
+            chdir: "{{ docker_dir }}"
+
+        - name: Validate candidate deployment
+          ansible.builtin.command:
+            argv: "{{ validator_base + ['--expected-image', target.image, '--expected-digest', target.digest, '--site', target.site, '--url', target.url] }}"
+          register: candidate_validation
+          retries: 12
+          delay: 5
+          until: candidate_validation.rc == 0
+          changed_when: false
+
+        - name: Optional simulated failure after checks
+          ansible.builtin.fail:
+            msg: "Simulated post-deployment validation failure"
+          when: simulate_failure | bool
+
+        - name: Report successful release (promotion requires manual review)
+          ansible.builtin.debug:
+            msg: "RELEASE ACCEPTED: {{ target.image }}. Review and promote cloud metadata manually."
+
+      rescue:
+        - name: Explain why recovery began
+          ansible.builtin.debug:
+            msg: "Candidate rejected by task '{{ ansible_failed_task.name }}'; restoring stable."
+
+        - name: Restore last-known-good tag in Cloud config
+          ansible.builtin.lineinfile:
+            path: "{{ cloud_env }}"
+            regexp: '^CUSTOM_TAG='
+            line: "CUSTOM_TAG={{ stable.image.rsplit(':', 1)[1] }}"
+            create: false
+            mode: '0600'
+          no_log: true
+
+        - name: Recreate configurator from stable image
+          ansible.builtin.command:
+            argv: "{{ compose_base + ['up', '-d', '--no-deps', '--pull', 'never', 'configurator'] }}"
+          args:
+            chdir: "{{ docker_dir }}"
+
+        - name: Ensure restored configurator completed cleanly
+          ansible.builtin.command:
+            argv: [docker, wait, dacn-cloud-configurator-1]
+          register: restored_config
+          changed_when: false
+          failed_when: restored_config.stdout | trim != '0'
+
+        - name: Recreate ONLY six application containers from stable image
+          ansible.builtin.command:
+            argv: "{{ compose_base + ['up', '-d', '--no-deps', '--pull', 'never'] + app_services }}"
+          args:
+            chdir: "{{ docker_dir }}"
+
+        - name: Independently re-validate the restored stable Cloud version
+          ansible.builtin.command:
+            argv: "{{ validator_base + ['--expected-image', stable.image, '--expected-digest', stable.digest, '--site', stable.site, '--url', stable.url] }}"
+          register: restored_check
+          retries: 12
+          delay: 5
+          until: restored_check.rc == 0
+          changed_when: false
+
+        - name: Mark the candidate attempt failed after successful restoration
+          ansible.builtin.fail:
+            msg: "ROLLBACK VERIFIED: stable image restored, candidate was rejected."

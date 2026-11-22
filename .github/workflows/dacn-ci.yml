@@ -1,0 +1,34 @@
+name: DACN CI - Python Syntax
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python-syntax:
+    name: Python Syntax Check
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Check Course Publishing source
+        run: |
+          python -m py_compile \
+            lms/lms/doctype/lms_course/lms_course.py \
+            lms/lms/doctype/lms_course/test_dacn_course_publishing.py \
+            lms/lms/doctype/lms_course/test_dacn_publishing_integration.py \
+            lms/lms/doctype/lms_course/test_dacn_publishing_permissions.py \
+            lms/tests/test_docperm_snapshot.py

@@ -1,0 +1,6 @@
+{
+  "image": "ghcr.io/dongocthaonguyen/dacn-frappe-lms:sha-b3f715564bab",
+  "digest": "sha256:dc672fce92ad7a8c4107c3991c15a74c4778afd63bd9a4767c6afa6783307bd5",
+  "site": "lms-cloud.localhost",
+  "url": "http://127.0.0.1:8200/"
+}

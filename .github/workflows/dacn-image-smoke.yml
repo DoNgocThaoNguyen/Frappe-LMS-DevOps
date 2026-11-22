@@ -1,0 +1,88 @@
+name: DACN CD - Image Smoke Test
+
+on:
+  workflow_call:
+    inputs:
+      image_ref:
+        description: GHCR image reference pinned by the build workflow
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "GHCR image tag"
+        required: true
+        default: "sha-dd6801086a5c"
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  image-smoke:
+    name: Verify published Docker image
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Select image for smoke test
+        shell: bash
+        env:
+          BUILD_IMAGE_REF: ${{ inputs.image_ref }}
+          MANUAL_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if [[ "$BUILD_IMAGE_REF" =~ ^"$repo"@sha256:[0-9a-f]{64}$ ]]; then
+            image="$BUILD_IMAGE_REF"
+          elif [[ -z "$BUILD_IMAGE_REF" && "$MANUAL_IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            image="ghcr.io/dongocthaonguyen/dacn-frappe-lms:$MANUAL_IMAGE_TAG"
+          else
+            echo "::error::Expected an image_ref pinned by digest from $repo or a valid manual image_tag."
+            exit 1
+          fi
+          printf 'IMAGE=%s\n' "$image" >> "$GITHUB_ENV"
+
+      - name: Login to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" |
+            docker login ghcr.io \
+              -u "${{ github.actor }}" \
+              --password-stdin
+
+      - name: Pull published image
+        run: |
+          docker pull "$IMAGE"
+
+      - name: Record image digest
+        run: |
+          docker image inspect "$IMAGE" \
+            --format '{{json .RepoDigests}}'
+
+      - name: Verify apps and backend code
+        run: |
+          docker run --rm --entrypoint bash "$IMAGE" -lc '
+            set -e
+            cd /home/frappe/frappe-bench
+
+            for app in frappe payments lms; do
+              test -d "apps/$app" || {
+                echo "Missing app: $app"
+                exit 1
+              }
+              echo "Found app: $app"
+            done
+
+            env/bin/python --version
+            bench version
+
+            grep -Fq \
+              "Add at least one lesson before publishing this course." \
+              apps/lms/lms/lms/doctype/lms_course/lms_course.py
+
+            env/bin/python -m py_compile \
+              apps/lms/lms/lms/doctype/lms_course/lms_course.py
+
+            echo "PASS: Image contains all apps and DACN validation."
+          '

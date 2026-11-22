@@ -1,0 +1,206 @@
+name: DACN CI - Frappe Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_and_smoke:
+        description: Build and smoke-test the image after Frappe tests pass (main only)
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/dacn-frappe-tests.yml"
+      - "lms/lms/doctype/lms_course/**"
+      - "lms/tests/test_docperm_snapshot.py"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/dacn-frappe-tests.yml"
+      - "lms/lms/doctype/lms_course/**"
+      - "lms/tests/test_docperm_snapshot.py"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ inputs.build_and_smoke && 'dacn-frappe-release' || 'dacn-frappe-tests' }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frappe-tests:
+    name: Unit, Regression, Integration & Permission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CI: "Yes"
+      BENCH_DIR: /home/runner/frappe-bench
+      FRAPPE_SHA: 4515014c87ece6cb20ee91d2cfb121c5cbd1ff4a
+      PAYMENTS_SHA: cca07d9f9392e2ea0e521c5975151db9e4b6c321
+
+    services:
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=12
+
+      redis-cache:
+        image: redis:8-alpine
+        ports:
+          - 13000:6379
+
+      redis-queue:
+        image: redis:8-alpine
+        ports:
+          - 11000:6379
+
+      redis-socketio:
+        image: redis:8-alpine
+        ports:
+          - 12000:6379
+
+    steps:
+      - name: Checkout DACN LMS
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install system dependencies and Bench CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mariadb-client libmariadb-dev pkg-config
+          python -m pip install --upgrade uv frappe-bench
+          npm install -g yarn@1.22.22
+
+      - name: Initialize Frappe Bench at verified commit
+        run: |
+          bench init "$BENCH_DIR" \
+            --frappe-branch version-16 \
+            --skip-redis-config-generation \
+            --skip-assets \
+            --python "$(which python)"
+          git -C "$BENCH_DIR/apps/frappe" fetch --depth=1 upstream "$FRAPPE_SHA"
+          git -C "$BENCH_DIR/apps/frappe" checkout --detach "$FRAPPE_SHA"
+          test "$(git -C "$BENCH_DIR/apps/frappe" rev-parse HEAD)" = "$FRAPPE_SHA"
+
+      - name: Install pinned Payments and DACN LMS
+        working-directory: /home/runner/frappe-bench
+        run: |
+          bench get-app --skip-assets --branch version-16 payments https://github.com/frappe/payments.git
+          git -C apps/payments fetch --depth=1 upstream "$PAYMENTS_SHA"
+          git -C apps/payments checkout --detach "$PAYMENTS_SHA"
+          test "$(git -C apps/payments rev-parse HEAD)" = "$PAYMENTS_SHA"
+          bench get-app --skip-assets lms "$GITHUB_WORKSPACE"
+          bench setup requirements --dev
+          bench version
+
+      - name: Create isolated Frappe test site
+        working-directory: /home/runner/frappe-bench
+        run: |
+          bench set-config -g redis_cache redis://127.0.0.1:13000
+          bench set-config -g redis_queue redis://127.0.0.1:11000
+          bench set-config -g redis_socketio redis://127.0.0.1:12000
+          mariadb -h 127.0.0.1 -u root -proot -e \
+            "SET GLOBAL character_set_server = 'utf8mb4'; SET GLOBAL collation_server = 'utf8mb4_unicode_ci';"
+          bench new-site test_site \
+            --db-type mariadb \
+            --db-host 127.0.0.1 \
+            --db-root-password root \
+            --admin-password admin
+          bench --site test_site install-app payments
+          bench --site test_site install-app lms
+          bench --site test_site set-config allow_tests true
+
+      - name: Run all 13 DACN-related tests
+        working-directory: /home/runner/frappe-bench
+        shell: bash
+        run: |
+          set -euo pipefail
+          modules=(
+            lms.lms.doctype.lms_course.test_dacn_course_publishing
+            lms.lms.doctype.lms_course.test_lms_course
+            lms.lms.doctype.lms_course.test_dacn_publishing_integration
+            lms.lms.doctype.lms_course.test_dacn_publishing_permissions
+            "lms.tests.test_dacn_demo_setup"
+          )
+          for module in "${modules[@]}"; do
+            echo "::group::Testing $module"
+            bench --site test_site run-tests --module "$module"
+            echo "::endgroup::"
+          done
+
+      - name: Show Frappe test logs on failure
+        if: failure()
+        run: |
+          if [ -f "$BENCH_DIR/logs/frappe.testing.log" ]; then
+            tail -n 180 "$BENCH_DIR/logs/frappe.testing.log"
+          fi
+
+  build:
+    name: Build release candidate
+    needs: frappe-tests
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.build_and_smoke
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/dacn-docker-build.yml
+
+  smoke:
+    name: Smoke-test release candidate
+    needs: build
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/dacn-image-smoke.yml
+    with:
+      image_ref: ${{ needs.build.outputs.image_ref }}
+
+  release-manifest:
+    name: Publish release candidate manifest
+    needs: [build, smoke]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Write release-candidate.json
+        shell: bash
+        env:
+          IMAGE_REF: ${{ needs.build.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+          if [[ ! "$IMAGE_REF" =~ ^"$repo"@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Expected an image reference pinned by digest from $repo."
+            exit 1
+          fi
+
+          jq -n \
+            --arg commit "$GITHUB_SHA" \
+            --arg image_ref "$IMAGE_REF" \
+            --argjson run_id "$GITHUB_RUN_ID" \
+            --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{commit: $commit, image_ref: $image_ref, run_id: $run_id, run_attempt: $run_attempt, run_url: $run_url}' \
+            > "$RUNNER_TEMP/release-candidate.json"
+
+      - name: Upload release-candidate.json
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-candidate.json
+          if-no-files-found: error

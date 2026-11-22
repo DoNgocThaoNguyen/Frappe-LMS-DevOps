@@ -1,0 +1,143 @@
+name: DACN CD - Build Docker Image
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      image_ref:
+        description: GHCR image pinned to its registry digest
+        value: ${{ jobs.build-and-push.outputs.image_ref }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    outputs:
+      image_ref: ${{ steps.publish.outputs.image_ref }}
+    name: Build and publish Frappe LMS image
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Free disk space before Docker build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== Disk space BEFORE cleanup ==="
+          df -h /
+
+          # GitHub-hosted runner only.
+          # Remove SDKs not needed by Frappe Docker build.
+          sudo rm -rf             /usr/local/lib/android             /usr/share/dotnet             /opt/ghc             /usr/local/.ghcup
+
+          echo "=== Disk space AFTER cleanup ==="
+          df -h /
+
+          echo "=== Docker disk usage ==="
+          docker system df
+
+      - name: Check out DACN LMS
+        uses: actions/checkout@v7
+
+      - name: Confirm main has not moved
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_sha="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [[ "$remote_sha" != "$GITHUB_SHA" ]]; then
+            echo "::error::main changed after this run started; restart on latest main"
+            exit 1
+          fi
+
+      - name: Get fixed Frappe Docker build resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v4.0.1 \
+            https://github.com/frappe/frappe_docker.git frappe_docker
+
+      - name: Prepare private apps manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path('deploy/apps.json')
+          apps = json.loads(path.read_text())
+          repo = os.environ['GITHUB_REPOSITORY']
+          plain = f'https://github.com/{repo}.git'
+          count = 0
+          for app in apps:
+              if app['url'].lower() == plain.lower():
+                  app['url'] = (
+                      'https://x-access-token:'
+                      + os.environ['GH_TOKEN']
+                      + '@github.com/' + repo + '.git'
+                  )
+                  count += 1
+          if count != 1:
+              raise SystemExit('Expected one DACN repository entry in deploy/apps.json')
+          output = Path(os.environ['RUNNER_TEMP']) / 'dacn-apps-private.json'
+          output.write_text(json.dumps(apps))
+          output.chmod(0o600)
+          print('Private build manifest prepared (credentials not displayed).')
+          PY
+
+      - name: Prepare Docker Buildx
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx create --name dacn-builder --driver docker-container --use
+          docker buildx inspect --bootstrap
+
+      - name: Log in to GitHub Container Registry
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io \
+            --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and publish versioned image
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          tag="$image:sha-${GITHUB_SHA:0:12}"
+          docker buildx build \
+            --metadata-file "$RUNNER_TEMP/dacn-build.json" \
+            --platform linux/amd64 \
+            --file frappe_docker/images/custom/Containerfile \
+            --secret "id=apps_json,src=$RUNNER_TEMP/dacn-apps-private.json" \
+            --build-arg PYTHON_VERSION=3.14 \
+            --build-arg NODE_VERSION=24.21.0 \
+            --build-arg FRAPPE_BRANCH=version-16 \
+            --build-arg INSTALL_CHROMIUM=false \
+            --build-arg "CACHE_BUST=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$tag" \
+            --push \
+            ./frappe_docker
+          digest="$(jq -er '.["containerimage.digest"] | strings | select(test("^sha256:[0-9a-f]{64}$"))' "$RUNNER_TEMP/dacn-build.json")"
+          image_ref="$image@$digest"
+          docker buildx imagetools inspect "$image_ref"
+          printf 'image_ref=%s\n' "$image_ref" >> "$GITHUB_OUTPUT"
+          printf 'Commit: `%s`\n\nImage: `%s`\n' "$GITHUB_SHA" "$image_ref" >> "$GITHUB_STEP_SUMMARY"
+          echo "Published image: $tag" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Delete temporary private manifest
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/dacn-apps-private.json"

@@ -1,0 +1,42 @@
+
+---
+- name: DACN - Validate Frappe LMS Staging
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    release_file: "{{ playbook_dir }}/../last_known_good.json"
+    release: "{{ lookup('ansible.builtin.file', release_file) | from_json }}"
+
+  tasks:
+    - name: Verify release configuration
+      ansible.builtin.assert:
+        that:
+          - release.image is defined
+          - release.digest is defined
+          - release.site is defined
+          - release.url is defined
+        fail_msg: "Release configuration is incomplete."
+
+    - name: Run Python Deployment Validator
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ playbook_dir }}/../validate_deployment.py"
+          - --expected-image
+          - "{{ release.image }}"
+          - --expected-digest
+          - "{{ release.digest }}"
+          - --site
+          - "{{ release.site }}"
+          - --url
+          - "{{ release.url }}"
+      register: validation_result
+      changed_when: false
+
+    - name: Display validation results
+      ansible.builtin.debug:
+        var: validation_result.stdout_lines
+

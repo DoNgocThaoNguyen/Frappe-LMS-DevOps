@@ -1,0 +1,10 @@
+[
+  {
+    "url": "https://github.com/frappe/payments.git",
+    "branch": "version-16"
+  },
+  {
+    "url": "https://github.com/DoNgocThaoNguyen/DACN-Frappe-LMS.git",
+    "branch": "main"
+  }
+]

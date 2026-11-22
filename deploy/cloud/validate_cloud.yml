@@ -1,0 +1,64 @@
+---
+- name: DACN - Verify existing Cloud LMS v2 (no deployment changes)
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    stable: "{{ lookup('ansible.builtin.file', playbook_dir + '/last_known_good_cloud.json') | from_json }}"
+    remote_dir: /home/ubuntu/DACN/SP2/cloud-local/automation
+  tasks:
+    - name: Ensure expected release metadata is complete
+      ansible.builtin.assert:
+        that:
+          - stable.image is defined
+          - stable.digest is defined
+          - stable.site == 'lms-cloud.localhost'
+          - stable.url == 'http://127.0.0.1:8200/'
+          - stable.image is match('^ghcr[.]io/dongocthaonguyen/dacn-frappe-lms:sha-[a-f0-9]{12}$')
+          - stable.digest is match('^sha256:[a-f0-9]{64}$')
+
+    - name: Create a directory for read-only validators on EC2
+      ansible.builtin.file:
+        path: "{{ remote_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0750'
+
+    - name: Copy original Python validator to EC2 (not Cloud config)
+      ansible.builtin.copy:
+        src: ../validate_deployment.py
+        dest: "{{ remote_dir }}/validate_deployment.py"
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+
+    - name: Copy extended Cloud validator to EC2
+      ansible.builtin.copy:
+        src: validate_cloud.py
+        dest: "{{ remote_dir }}/validate_cloud.py"
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+
+    - name: Validate image and services without modifying running containers
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ remote_dir }}/validate_cloud.py"
+          - --expected-image
+          - "{{ stable.image }}"
+          - --expected-digest
+          - "{{ stable.digest }}"
+          - --site
+          - "{{ stable.site }}"
+          - --url
+          - "{{ stable.url }}"
+          - --project
+          - dacn-cloud
+      register: validation_result
+      changed_when: false
+
+    - name: Display Cloud validation evidence
+      ansible.builtin.debug:
+        var: validation_result.stdout_lines
