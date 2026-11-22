@@ -19,3 +19,12 @@ test-results
 playwright-report
 blob-report
 playwright/.auth
+.env
+.env.*
+cloud.env
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+!.env.example
