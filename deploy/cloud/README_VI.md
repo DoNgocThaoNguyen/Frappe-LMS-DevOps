@@ -1,56 +1,32 @@
-# DACN — Cloud Automation Kit (AWS EC2, 17/11/2026)
+# Triển khai và kiểm chứng Cloud (cập nhật 22/11/2026)
 
-**Thiết kế**: Ansible chạy trên WSL (control node), kết nối qua SSH đến AWS EC2 (managed node). Docker và Python validator được chạy **trên EC2**, không trên Docker Desktop tại laptop.
+Thư mục này chứa mã triển khai Frappe LMS trên AWS EC2. [README chính](../../README.md) mô tả toàn bộ chu trình phát hành. Tài liệu này thay thế ghi chú chuẩn bị ngày 17/11, vốn được viết trước khi hoàn tất tích hợp Jenkins.
 
-**Kit chỉ bổ sung** `deploy/cloud/` vào repo LMS. Không ghi đè `deploy/validate_deployment.py` hay playbooks Local Staging.
+## Thành phần
 
-## Cấu trúc
+- last_known_good_cloud.json và target_release_cloud.json: image tag, digest, site và URL kiểm tra cục bộ được quản lý bằng pull request. Hiện hai tệp cùng trỏ tới bản đã được Jenkins #16 kiểm chứng và PR #6 ghi nhận.
+- deploy_cloud.yml: Ansible kiểm tra trước triển khai, tải image từ GHCR theo digest đã duyệt, triển khai các dịch vụ ứng dụng, xác minh và rollback riêng image.
+- validate_cloud.py: kiểm tra digest, image ID thực chạy, sáu dịch vụ ứng dụng, MariaDB, hai Redis, danh sách ứng dụng và HTTP 200.
+- validate_cloud.yml: chạy kiểm tra trạng thái trên EC2; ngoài việc chép hai tập lệnh validator vào thư mục automation, không thay đổi Compose hay dữ liệu.
 
-- `deploy/cloud/last_known_good_cloud.json`: stable LMS v2 và Cloud site.
-- `deploy/cloud/target_release_cloud.json`: mặc định cùng stable; không tự kích hoạt deployment.
-- `deploy/cloud/validate_cloud.py`: validator mở rộng, kiểm tra digest, 6 container app, image ID, MariaDB, Redis, apps và HTTP.
-- `deploy/cloud/validate_cloud.yml`: chạy validator trên EC2 qua SSH, chỉ thay đổi/copy 2 Python files trong thư mục automation; **không sửa Compose, containers, dữ liệu**.
-- `deploy/cloud/deploy_cloud.yml`: playbook triển khai candidate và rollback có guard; **chưa chạy ngay**.
+## Quy trình phát hành
 
-## Pha A — Chỉ kiểm tra Stable Cloud (chạy trước)
+1. Chạy thủ công [DACN CI - Frappe Tests](../../.github/workflows/dacn-frappe-tests.yml) trên nhánh main với build_and_smoke=true. Lấy run ID, commit và image digest từ run thành công cùng release manifest.
+2. Chạy job Jenkins dacn-release-digest từ nhánh main, điền GHA_RUN_ID mới và EC2_HOST hiện tại. So sánh commit, run ID và digest mà Jenkins xác minh với GitHub Actions trước khi bấm Approve. Nếu GHA_RUN_ID trống, job chỉ chạy kiểm thử digest.
+3. Sau phê duyệt, Jenkins cấp credential GHCR quyền đọc cho Ansible. Playbook kiểm tra bản stable và tính toàn vẹn backup, đăng nhập bằng Docker config tạm, tải đúng digest, gắn tag và xóa Docker config tạm.
+4. Playbook tạo lại configurator và sáu dịch vụ ứng dụng, rồi chạy validator. Nếu kiểm chứng thất bại, khối rescue đưa **image ứng dụng** về bản last-known-good và kiểm tra lại. Khối này không restore cơ sở dữ liệu.
+5. Chỉ sau khi có RELEASE ACCEPTED và một lần kiểm tra validator độc lập đạt PASS, cập nhật cả hai JSON về tag và digest đã kiểm chứng qua pull request. Promotion vẫn là thao tác thủ công. Chạy lại candidate đã là stable sẽ bị từ chối.
 
-1. Giải nén kit từ WSL vào `~/DACN/SP2/frappe_docker/development/frappe-bench/apps/lms`.
-2. Kiểm tra file mới `ls deploy/cloud/` và `git status --short`.
-3. Tại WSL, cập nhật IP công cộng mới nhất từ AWS Console, không mặc định dùng IP cũ:
+## Bằng chứng ngày 22/11/2026
 
-```bash
-cd ~/DACN/SP2/frappe_docker/development/frappe-bench/apps/lms
-EC2_IP='NHAP_PUBLIC_IPV4_HIEN_TAI'
-ANSIBLE="$HOME/DACN/SP2/ansible-venv/bin/ansible-playbook"
-"$ANSIBLE" --version
-ssh -o IdentitiesOnly=yes -i "$HOME/.ssh/dacn-frappe-lms-key.pem" "ubuntu@$EC2_IP" 'echo SSH_TO_EC2_PASS'
-```
+- GitHub Actions run 44930522016; commit b3f715564bab025185dea6fbf65e48665e95236a; digest sha256:dc672fce92ad7a8c4107c3991c15a74c4778afd63bd9a4767c6afa6783307bd5.
+- Jenkins #16: phê duyệt thủ công, tải image theo digest trên EC2, RELEASE ACCEPTED, SUCCESS; recap ok=29, failed=0, unreachable=0, rescued=0.
+- Validator chạy độc lập trên EC2: sáu dịch vụ có image ID khớp, MariaDB healthy, hai Redis PONG, ứng dụng frappe/payments/lms và HTTP 200; kết luận CLOUD DEPLOYMENT VALIDATION: PASS.
+- PR #6 cập nhật metadata stable và target. Run #16 không kích hoạt nhánh rescue.
 
-4. Chạy playbook validation, không chạy `deploy_cloud.yml`:
+## Phạm vi và giới hạn
 
-```bash
-"$ANSIBLE" -i "$EC2_IP," -u ubuntu \
-  --private-key "$HOME/.ssh/dacn-frappe-lms-key.pem" \
-  -e '{"ansible_ssh_common_args":"-o IdentitiesOnly=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3"}' \
-  deploy/cloud/validate_cloud.yml
-```
-
-Kết quả mong đợi: `CLOUD DEPLOYMENT VALIDATION: PASS` và recap `failed=0`. Các thành phần kiểm tra: stable digest v2, 6 application services, image ID thực chạy, MariaDB healthy, 2 Redis PONG, frappe/payments/lms, HTTP 200.
-
-> Để tránh làm lộ mật khẩu: KHÔNG hiển thị `cloud.env`, `site_config.json`, private key hoặc PAT khi gửi log.
-
-## Pha B — Chỉ sau khi chuẩn bị candidate image và phê duyệt
-
-`deploy_cloud.yml` mặc định sẽ **từ chối** chạy nếu không có `-e cloud_deploy_approved=true`; ngoài ra yêu cầu target khác stable, candidate đã tồn tại trên EC2, backup DB hiện diện, stable baseline phải PASS. Nó chỉ chạy Compose trên `configurator` và sáu service `backend, frontend, websocket, queue-short, queue-long, scheduler`, không thay đổi db/redis và không xóa volumes. Candidate fail sẽ chạy block `rescue` để trở về stable.
-
-### Cảnh báo vận hành
-
-- Bản backup hiện ở cùng EBS EC2, không phải bản sao off-instance và **chưa restore thử**. Sao lưu ra ngoài EC2 trước khi làm thử nghiệm có rủi ro cao.
-- Ansible `rescue` **không được bảo đảm kích hoạt khi mất kết nối SSH hoặc máy EC2 unreachable**. Nếu mất mạng giữa deployment cần kiểm tra và phục hồi thủ công. Xem tài liệu Ansible blocks.
-- `--pull never`: candidate image phải tải hoặc build xong trên EC2 trước khi thử.
-- Dòng `CUSTOM_TAG` trong `cloud.env` chỉ được thay đổi khi thực hiện deployment có guard; DB_PASSWORD giữ nguyên.
-- Không dùng `docker compose down -v`, `docker volume prune`, `docker system prune -a`, không chạy `bench new-site` lại.
-- Khối `rescue` đánh dấu playbook FAIL có chủ đích sau thông điệp `ROLLBACK VERIFIED`; phân biệt với lỗi rollback không hoàn tất.
-- Khi một candidate thật được duyệt và triển khai thành công, metadata `last_known_good_cloud.json` cần được cập nhật/promotion sau khi review, không thực hiện tự động.
-
-**Chưa được kiểm thử trên EC2 thực trong môi trường tác giả**: Bộ file đã được kiểm tra cú pháp Python và cấu trúc YAML offline. Bạn phải xác nhận Pha A PASS trước khi chạy Pha B trên EC2.
+- Cổng kiểm tra backup yêu cầu có tệp DB nén hợp lệ qua gzip -t. Backup trong thí nghiệm nằm trên EBS của EC2; chưa chứng minh restore từ bản sao nằm ngoài máy.
+- Ansible rescue không bảo đảm chạy nếu SSH hoặc EC2 mất kết nối. Tình huống đó cần kiểm tra và khôi phục thủ công.
+- Metadata Cloud không chứa cloud.env, khóa SSH riêng hay token GHCR. URL 127.0.0.1:8200 là loopback trên EC2, không phải địa chỉ demo công khai.
+- Không dọn Docker volume hoặc tạo lại site trong quy trình cập nhật riêng image.
