@@ -28,3 +28,4 @@ cloud.env
 *.pfx
 *.jks
 !.env.example
+yarn-error.log
