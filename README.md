@@ -1,186 +1,54 @@
-<div align="center" markdown="1">
+# Frappe LMS DevOps capstone: verified CI/CD on AWS EC2
 
-<img src=".github/lms-logo.png" alt="Frappe Learning logo" width="80" height="80"/>
-<h1>Frappe Learning</h1>
+I used the open source [Frappe Learning (LMS)](https://github.com/frappe/lms) application as the workload for an individual DevOps project. My work in this repository covers CI tests, container image publishing, release verification, a Jenkins approval gate, Ansible deployment, Python validation, and image-only rollback. The LMS application and its original features belong to the upstream Frappe project.
 
-**Easy to use, open source, Learning Management System**
+**Portfolio snapshot:** This repository was created from a reviewed source snapshot with a fresh Git history. The operational repository, its GitHub Actions run logs, Jenkins instance, and deployment credentials remain private. This snapshot contains source code for review; it is not a live public demo or a ready-to-run production deployment.
 
-![Tests](https://img.shields.io/endpoint?url=https://dashboard.cypress.io/badge/simple/vandxn/main&style=flat&logo=cypress)
+## Release flow
 
-</div>
-
-
-<div align="center">
-	<img src=".github/hero.png?v=5" alt="Hero Image" width="72%" />
-</div>
-<br />
-<div align="center">
-	<a href="https://frappe.io/learning">Website</a>
-	-
-	<a href="https://docs.frappe.io/learning">Documentation</a>
-</div>
-
-## Frappe Learning
-Frappe Learning is an easy-to-use learning system that helps you bring structure to your content.
-
-### Motivation
-In 2021, we were looking for a Learning Management System to launch [Mon.School](https://monschool.frappe.cloud/) for FOSS United. We checked out Moodle, but it didn’t feel right. The forms were unnecessarily lengthy and the UI was confusing. It shouldn't be this hard to create a course right? So I started making a learning system for Mon.School which soon became a product in itself. The aim is to have a simple platform that anyone can use to launch a course of their own and make knowledge sharing easier.
-
-### Key Features
-
-- **Structured Learning**: Design a course with a 3-level hierarchy, where your courses have chapters and you can group your lessons within these chapters. This ensures that the context of the lesson is set by the chapter.
-
-- **Live Classes**: Group learners into batches based on courses and duration. You can then create Zoom live class for these batches right from the app. Learners get to see the list of live classes they have to take as a part of this batch.
-
-- **Quizzes and Assignments**: Create quizzes where questions can have single-choice, multiple-choice options, or can be open ended. Instructors can also add assignments which learners can submit as PDF's or Documents.
-
-- **Getting Certified**: Once a learner has completed the course or batch, you can grant them a certificate. The app provides an inbuilt certificate template. You can use this or else create a template of your own and use that instead.
-
-<details>
-<summary>View Screenshots</summary>
-
-
-![Batch](.github/batch.png)
-<div align="center">
-	<sub>
-		Create batches to group your learners
-	</sub>
-</div>
-<br>
-
-
-![Quiz](.github/quiz.png)
-<div align="center">
-	<sub>
-		Evaluate their knowledge by quizzes
-	</sub>
-</div>
-<br>
-
-
-![Cerficicate](.github/certificate.png)
-<div align="center">
-	<sub>
-		Autenticate their work with certification
-	</sub>
-</div>
-</details>
-
-
-### Under the Hood
-
-- [**Frappe Framework**](https://github.com/frappe/frappe): A full-stack web application framework.
-
-- [**Frappe UI**](https://github.com/frappe/frappe-ui): A Vue-based UI library, to provide a modern user interface.
-
-## Production Setup
-
-### Managed Hosting
-
-You can try [Frappe Cloud](https://frappecloud.com), a simple, user-friendly and sophisticated [open-source](https://github.com/frappe/press) platform to host Frappe applications with peace of mind.
-
-It takes care of installation, setup, upgrades, monitoring, maintenance and support of your Frappe deployments. It is a fully featured developer platform with an ability to manage and control multiple Frappe deployments.
-
-<div>
-	<a href="https://frappecloud.com/lms/signup" target="_blank">
-		<picture>
-			<source media="(prefers-color-scheme: dark)" srcset="https://frappe.io/files/try-on-fc-white.png">
-			<img src="https://frappe.io/files/try-on-fc-black.png" alt="Try on Frappe Cloud" height="28" />
-		</picture>
-	</a>
-</div>
-
-### Self Hosting
-
-Follow these steps to set up Frappe Learning in production:
-
-**Step 1**: Download the easy install script
-
-```bash
-wget https://frappe.io/easy-install.py
+```mermaid
+flowchart TD
+    A["GitHub Actions: tests, build, smoke test"] --> B["GHCR: image digest and release manifest"]
+    B --> C["Jenkins: verify run and manual approval"]
+    C --> D["Ansible: preflight, pull by digest, deploy"]
+    D --> E["AWS EC2: Docker Compose and Frappe LMS"]
+    E --> F["Python validator: services, dependencies, HTTP"]
+    F -->|Validation fails| G["Restore last-known-good image"]
+    F -->|Validation passes| H["Manual promotion of stable metadata"]
 ```
 
-**Step 2**: Run the deployment command
+1. [GitHub Actions](.github/workflows/dacn-frappe-tests.yml) runs application tests, builds and smoke tests an image, and publishes a release manifest with the commit, run ID, and immutable GHCR digest.
+2. [Jenkins](Jenkinsfile) verifies the run and manifest, executes digest tests, and pauses for a human approval before deployment.
+3. [Python](deploy/prepare_cloud_release.py) binds the approved run to the expected image. [Ansible](deploy/cloud/deploy_cloud.yml) checks the existing Cloud state and backup, logs into GHCR using a Jenkins credential, pulls the approved digest, applies its tag, deploys the application services, and removes temporary Docker credentials.
+4. The [Cloud validator](deploy/cloud/validate_cloud.py) checks the image ID and digest, six application services, MariaDB, Redis, installed apps, and HTTP. On a failed deployment check, Ansible restores the last-known-good **application image** and validates it. The database is not restored by this image-only rollback.
+5. After a successful deployment, a reviewed pull request updates the [stable and target metadata](deploy/cloud/last_known_good_cloud.json). Promotion is manual.
 
-```bash
-python3 ./easy-install.py deploy \
-    --project=learning_prod_setup \
-    --email=your_email.example.com \
-    --image=ghcr.io/frappe/lms \
-    --version=stable \
-    --app=lms \
-    --sitename subdomain.domain.tld
-```
+## Technology and implementation
 
-Replace the following parameters with your values:
-- `your_email.example.com`: Your email address
-- `subdomain.domain.tld`: Your domain name where Learning will be hosted
+| Area | Stack and work |
+| --- | --- |
+| Application | Frappe Framework, Frappe LMS, Payments, Vue; additional LMS tests in this project |
+| CI and images | GitHub Actions, Python tests, Docker Buildx, GHCR, immutable digest, release manifest |
+| Approval and CD | Jenkins Pipeline, human approval, Python manifest verification, Ansible |
+| Runtime | AWS EC2, Docker Compose, MariaDB, Redis, six Frappe application services |
+| Guardrails | Backup integrity precheck, digest pull, post-deployment Python validation, image-only rollback |
 
-The script will set up a production-ready instance of Frappe Learning with all the necessary configurations in about 5 minutes.
+## Observed results from the private deployment
 
-**Note:** To avoid a `404 Page Not Found` error:
-- If hosting on a **public server**, make sure your DNS **A record** points to your server's IP.
-- If hosting **locally**, map your domain to `127.0.0.1` in your `/etc/hosts` file:
+| Check | Recorded result |
+| --- | --- |
+| GitHub Actions candidate | Run `44930522016` passed tests, build, image smoke test, and manifest publication for commit `b3f715564bab025185dea6fbf65e48665e95236a`. |
+| Published image | `ghcr.io/dongocthaonguyen/dacn-frappe-lms@sha256:dc672fce92ad7a8c4107c3991c15a74c4778afd63bd9a4767c6afa6783307bd5` |
+| Jenkins deployment | Build `#16` verified the candidate, received manual approval, pulled the digest on EC2, and ended `SUCCESS` with `RELEASE ACCEPTED` (`ok=29`, `failed=0`, `unreachable=0`). |
+| Independent EC2 validation | `CLOUD DEPLOYMENT VALIDATION: PASS`; six application services had matching image IDs, MariaDB was healthy, both Redis instances returned PONG, apps `frappe`/`payments`/`lms` were installed, and HTTP returned 200. |
+| Stable promotion | A reviewed pull request updated both stable and target image metadata to the validated release. |
 
-## Development Setup
+The successful build did **not** exercise the rollback path (`rescued=0` in its Ansible recap). Build #15 timed out while awaiting approval and did not deploy. The private operational run logs can be provided for review on request.
 
-### Docker
+## Review the code
 
-You need Docker, docker-compose and git setup on your machine. Refer [Docker documentation](https://docs.docker.com/). After that, follow below steps:
+- [Application CI and release manifest](.github/workflows/dacn-frappe-tests.yml) · [Docker image build](.github/workflows/dacn-docker-build.yml) · [Jenkins pipeline](Jenkinsfile)
+- [Run verification](deploy/read_release_candidate.py) · [approval preparation](deploy/prepare_cloud_release.py) · [digest tests](deploy/test_release_digest.py) · [release preparation tests](deploy/test_prepare_cloud_release.py)
+- [Ansible deployment and rollback](deploy/cloud/deploy_cloud.yml) · [EC2 validator](deploy/cloud/validate_cloud.py) · [Cloud deployment notes](deploy/cloud/README_VI.md)
 
-**Step 1**: Setup folder and download the required files
-
-    mkdir frappe-learning
-    cd frappe-learning
-
-    # Download the docker-compose file
-    wget -O docker-compose.yml https://raw.githubusercontent.com/frappe/lms/develop/docker/docker-compose.yml
-
-    # Download the setup script
-    wget -O init.sh https://raw.githubusercontent.com/frappe/lms/develop/docker/init.sh
-
-**Step 2**: Run the container and daemonize it
-
-    docker compose up -d
-
-**Step 3**: The site [http://lms.localhost:8000/lms](http://lms.localhost:8000/lms) should now be available. The default credentials are:
-- Username: Administrator
-- Password: admin
-
-### Local
-
-To setup the repository locally follow the steps mentioned below:
-
-1. Install bench and setup a `frappe-bench` directory by following the [Installation Steps](https://frappeframework.com/docs/user/en/installation)
-1. Start the server by running
-	```sh
-	$ bench start
-	```
-1. In a separate terminal window, run the following commands.
-	```sh
-	$ bench new-site learning.test
- 	$ bench --site learning.test add-to-hosts
- 	$ bench get-app https://github.com/frappe/payments
- 	$ bench get-app https://github.com/frappe/lms
- 	$ bench --site learning.test install-app lms
- 	
-	```
-1. Now open the URL `http://learning.test:8000/lms` in your browser, you should see the app running
-
-## Learn and connect
-
-- [Telegram Public Group](https://t.me/frappelms)
-- [Discuss Forum](https://discuss.frappe.io/c/lms/70)
-- [Documentation](https://docs.frappe.io/learning)
-- [YouTube](https://www.youtube.com/channel/UCn3bV5kx77HsVwtnlCeEi_A)
-
-<br>
-<br>
-<div align="center" style="padding-top: 0.75rem;">
-	<a href="https://frappe.io" target="_blank">
-		<picture>
-			<source media="(prefers-color-scheme: dark)" srcset="https://frappe.io/files/Frappe-white.png">
-			<img src="https://frappe.io/files/Frappe-black.png" alt="Frappe Technologies" height="28"/>
-		</picture>
-	</a>
-</div>
+No deployment credentials, EC2 SSH private key, or server runtime environment file are included in this snapshot. The `127.0.0.1` URLs in release metadata are loopback checks executed on the EC2 host. See the upstream [Frappe LMS documentation](https://docs.frappe.io/learning) and this repository's [AGPL-3.0 license](license.txt).
